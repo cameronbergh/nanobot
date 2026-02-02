@@ -3,8 +3,10 @@
 import os
 from typing import Any
 
+import asyncio
 import litellm
 from litellm import acompletion
+from rlm.core.rlm import RLM
 
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 
@@ -86,31 +88,79 @@ class LiteLLMProvider(LLMProvider):
         if self.is_vllm:
             model = f"hosted_vllm/{model}"
         
-        kwargs: dict[str, Any] = {
-            "model": model,
-            "messages": messages,
+        # Configure backend kwargs for RLM
+        backend_kwargs: dict[str, Any] = {
+            "model_name": model,
             "max_tokens": max_tokens,
             "temperature": temperature,
         }
         
-        # Pass api_base directly for custom endpoints (vLLM, etc.)
+        if self.api_key:
+            backend_kwargs["api_key"] = self.api_key
         if self.api_base:
-            kwargs["api_base"] = self.api_base
+            backend_kwargs["api_base"] = self.api_base
+
+        # Instantiate RLM
+        rlm = RLM(
+            backend="litellm",
+            backend_kwargs=backend_kwargs,
+            verbose=False
+        )
         
-        if tools:
-            kwargs["tools"] = tools
-            kwargs["tool_choice"] = "auto"
-        
+        # Extract root prompt from last user message if available
+        root_prompt = None
+        if messages and messages[-1].get("role") == "user":
+            root_prompt = str(messages[-1].get("content", ""))
+
         try:
-            response = await acompletion(**kwargs)
-            return self._parse_response(response)
+            # Run RLM completion in executor
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(
+                None,
+                lambda: rlm.completion(prompt=messages, root_prompt=root_prompt)
+            )
+            return self._parse_rlm_response(result, model)
         except Exception as e:
             # Return error as content for graceful handling
             return LLMResponse(
-                content=f"Error calling LLM: {str(e)}",
+                content=f"Error calling RLM: {str(e)}",
                 finish_reason="error",
             )
     
+    def _parse_rlm_response(self, result: Any, model: str) -> LLMResponse:
+        """Parse RLM response into our standard format."""
+
+        # Calculate usage
+        usage = {}
+        if result.usage_summary and result.usage_summary.model_usage_summaries:
+            # Try to get usage for the requested model, or aggregate
+            if model in result.usage_summary.model_usage_summaries:
+                 summary = result.usage_summary.model_usage_summaries[model]
+                 usage = {
+                     "prompt_tokens": summary.total_input_tokens,
+                     "completion_tokens": summary.total_output_tokens,
+                     "total_tokens": summary.total_input_tokens + summary.total_output_tokens
+                 }
+            else:
+                # Aggregate if specific model not found or multiple models
+                total_input = 0
+                total_output = 0
+                for summary in result.usage_summary.model_usage_summaries.values():
+                    total_input += summary.total_input_tokens
+                    total_output += summary.total_output_tokens
+                usage = {
+                     "prompt_tokens": total_input,
+                     "completion_tokens": total_output,
+                     "total_tokens": total_input + total_output
+                 }
+
+        return LLMResponse(
+            content=result.response,
+            tool_calls=[], # RLM handles tools internally
+            finish_reason="stop",
+            usage=usage,
+        )
+
     def _parse_response(self, response: Any) -> LLMResponse:
         """Parse LiteLLM response into our standard format."""
         choice = response.choices[0]
